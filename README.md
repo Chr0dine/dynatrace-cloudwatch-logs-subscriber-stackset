@@ -2,7 +2,7 @@
 
 A CloudFormation template, deployed as a **StackSet**, that automatically subscribes CloudWatch log groups to the Dynatrace Firehose delivery stream when they are tagged for monitoring, and unsubscribes them when the tag is removed.
 
-When someone applies the opt-in tag (for example `SendLogToDynatrace=true`) to a log group, CloudTrail records the call, an EventBridge rule picks it up, and a Lambda function subscribes **that log group**. Removing the tag (or changing its value) triggers the same function to remove the subscription again, so the tag stays the single source of truth. A daily full check also reviews every tagged log group, catching any that were skipped earlier. Log groups are only subscribed if they also carry the required business tags (`BU:ApplicationName`, `BU:GEARID`, `BU:SoftwareInstallationId`), matched regardless of capitalization.
+When someone applies the opt-in tag (for example `SendLogToDynatrace=true`) to a log group, CloudTrail records the call, an EventBridge rule picks it up, and a Lambda function subscribes **that log group**. Removing the tag (or changing its value) triggers the same function to remove the subscription again, so the tag stays the single source of truth. A daily full check also reviews every tagged log group, catching any whose tagging event was missed.
 
 You choose the organizational units (OUs) and regions when you deploy the StackSet. Each account and region gets one stack instance. When VPC networking is enabled, each instance finds its own subnets and security groups by tag, so one set of parameters works across accounts whose network IDs all differ.
 
@@ -42,9 +42,8 @@ CloudTrail ──► EventBridge rule ──► Subscriber Lambda
                                         ├─ 2. Not tagged TAG_KEY=TAG_VALUE any more?
                                         │       UNSUBSCRIBE_ON_TAG_REMOVAL=true  → delete the managed filter
                                         │       UNSUBSCRIBE_ON_TAG_REMOVAL=false → stop
-                                        ├─ 3. Stop if a required BU: tag is missing or blank
-                                        ├─ 4. Find the Dynatrace Firehose stream and IAM role (cached)
-                                        └─ 5. Create or update that log group's subscription filter
+                                        ├─ 3. Find the Dynatrace Firehose stream and IAM role (cached)
+                                        └─ 4. Create or update that log group's subscription filter
 ```
 
 The function always acts on the log group's **current** tags, not on the kind of event. If someone tags and then quickly untags a log group (or the reverse), both runs see the final state and agree.
@@ -55,9 +54,8 @@ The function always acts on the log group's **current** tags, not on the kind of
 Daily schedule / manual run ──► Subscriber Lambda
                                     │
                                     ├─ 1. List every log group tagged TAG_KEY=TAG_VALUE
-                                    ├─ 2. Skip any missing a required BU: tag
-                                    ├─ 3. Find the Dynatrace Firehose stream and IAM role (always fresh)
-                                    └─ 4. Create or update the subscription filter on the rest
+                                    ├─ 2. Find the Dynatrace Firehose stream and IAM role (always fresh)
+                                    └─ 3. Create or update the subscription filter on each one
 ```
 
 Bulk tagging 200 log groups therefore produces 200 short targeted runs, each touching one log group, rather than 200 runs that each check everything. Both modes are idempotent: log groups that are already correctly subscribed are left alone.
@@ -81,7 +79,6 @@ When the toggle is `false`, the lookup function and its role aren't created, and
 | Firehose stream | Name contains `FIREHOSE_NAME_CONTAINS` **and** the region (e.g. `us-east-1`), case-insensitive. Exactly one stream must match, and it must be `ACTIVE`. |
 | CloudWatch Logs role | Name contains `ROLE_NAME_CONTAINS` **and** the region, case-insensitive. Its trust policy must allow `logs.amazonaws.com`. Exactly one role must match. |
 | Opt-in tag | `TAG_KEY` and `TAG_VALUE` are matched exactly (case-sensitive) by the EventBridge rules and by the function. In a targeted check the function re-reads the log group's tags, so the latest change always wins. |
-| Required tags | Each key in `REQUIRED_TAG_KEYS` must be present with a non-blank value. Key matching is case-insensitive, so `BU:GEARID`, `BU:gearid` and `bu:GearId` are all accepted. If a log group has several spellings of the same key, any one with a value satisfies it. |
 | Subnets and security groups | Tag key matched exactly; tag value matched case-sensitively, with `*` and `?` as wildcards (EC2 filter rules). |
 | Unsubscribe | Only the filter named `SUBSCRIPTION_FILTER_NAME` is removed. Any other subscription filters on the log group are left alone. |
 
@@ -95,7 +92,6 @@ Each run returns a summary with a `mode` field (`targeted` or `full`), counts pe
 | `updated` | The managed filter existed but pointed at the wrong stream, role or pattern, and was corrected. |
 | `exists` | Already correct; nothing changed. |
 | `unsubscribed` | Targeted check only: the log group is no longer opted in, and its managed filter was removed. |
-| `missing_tags` | Skipped because one or more required tags are missing or blank. The log lists which ones. |
 | `not_tagged` | Targeted check only: the log group isn't opted in and has no managed filter to remove (or no longer exists), or unsubscribing is turned off. Nothing to do. |
 | `skipped` | Skipped because the log group already has two other subscription filters (the CloudWatch Logs limit). |
 | `error` | An AWS error occurred for this log group. Other log groups are still processed. |
@@ -152,7 +148,6 @@ All parameters are set once for the whole StackSet. They can be overridden per a
 | --- | --- | --- |
 | `TAG_KEY` | none (required) | Opt-in tag key. Case-sensitive. |
 | `TAG_VALUE` | `true` | Opt-in tag value. Case-sensitive. |
-| `REQUIRED_TAG_KEYS` | `BU:ApplicationName,BU:GEARID,BU:SoftwareInstallationId` | Comma-separated. Case-insensitive keys, values must be non-blank. Leave empty to disable the check. |
 | `FIREHOSE_NAME_CONTAINS` | none (required) | Text in the Dynatrace Firehose stream name. |
 | `ROLE_NAME_CONTAINS` | none (required) | Text in the CloudWatch Logs → Firehose role name. Also scopes the function's `iam:PassRole` permission, which **is** case-sensitive, so enter it with the role name's exact capitalization. |
 | `SUBSCRIPTION_FILTER_NAME` | `DynatraceManagedSubscription` | Name of the filter the function manages, and the only one it ever removes. |
@@ -198,7 +193,7 @@ Only created when VPC networking is enabled. The role has `AWSLambdaBasicExecuti
 
 ## Deployment
 
-The template is about 69 KB, over the 51,200-byte limit for passing a template inline, so the CLI must read it from S3. Console uploads handle this automatically.
+The template is about 64 KB, over the 51,200-byte limit for passing a template inline, so the CLI must read it from S3. Console uploads handle this automatically.
 
 ### Console
 
@@ -254,7 +249,7 @@ Do these in one target account and region first.
 
 1. **Check the network lookup** (VPC networking enabled). The stack instance's outputs list the VPC, subnets and security groups found. Confirm they're the private ones you expected.
 2. **Backfill.** Log groups that were tagged before the stack existed are picked up by the first daily full check. To do it immediately, run the function from the Lambda console's **Test** tab with `{}` as the event; the response should show `"mode": "full"` and the counts.
-3. **Test the trigger.** On a test log group that has all three BU tags, apply the opt-in tag the way your teams normally do, for example:
+3. **Test the trigger.** On a test log group, apply the opt-in tag the way your teams normally do, for example:
 
    ```bash
    aws logs tag-resource \
@@ -272,7 +267,6 @@ Do these in one target account and region first.
    ```
 
    The function should log `Removed subscription from NAME`, and the filter should be gone.
-5. **Test the tag check.** Repeat step 3 with a log group missing one BU tag. The function should log a warning naming the missing tag.
 
 ## Operations
 
@@ -327,7 +321,6 @@ The code that runs is the inline copy in the template's `SubscriberFunction` →
 | `No Firehose delivery stream was found` / `Multiple Firehose delivery streams matched` | `FIREHOSE_NAME_CONTAINS` too narrow or too broad, the region isn't in the stream name, or the StackSet deployed to a region without a stream | Adjust the parameter, or remove that region's stack instances. |
 | `No CloudWatch Logs subscription role was found` / `Multiple ... roles matched` | `ROLE_NAME_CONTAINS` too narrow or too broad, region missing from the name, or the role doesn't trust `logs.amazonaws.com` | Adjust the parameter or the role's trust policy. |
 | `AccessDenied` on `iam:PassRole` | `ROLE_NAME_CONTAINS` capitalization differs from the actual role name | Re-enter it with the exact capitalization. |
-| Log group reported as `missing_tags` | One or more BU tags missing or blank | Add the tags. The next daily full check subscribes it, or run the function manually with `{}`. |
 | Log group reported as `not_tagged` | The opt-in tag was removed (or the log group deleted) and there was no managed filter to remove | Nothing to do, unless the tag removal was unintended. |
 | Log group reported as `skipped` | It already has two other subscription filters | Remove one, or leave it out of Dynatrace. |
 | `Could not find a log group in the CloudTrail event` warning | Unexpected event shape | The function falls back to a full check automatically. |
@@ -336,9 +329,7 @@ The code that runs is the inline copy in the template's `SubscriberFunction` →
 ## Limitations
 
 - **Unsubscribing is event-driven only.** The daily full check adds missing subscriptions but doesn't look for subscriptions to remove: that would mean checking the filters on every log group in the account, every day. A removal missed by the untag rule (tag removed through Tag Editor or the Resource Groups Tagging API, CloudTrail gap, or a run dropped after retries) leaves the subscription in place. Re-apply and remove the tag with `aws logs` to retry it.
-- **Removing a BU tag doesn't unsubscribe.** Only the opt-in tag controls removal. A subscribed log group that later loses a required BU tag stays subscribed.
 - **Deleting a stack instance doesn't unsubscribe.** Existing subscription filters stay in place.
-- **Late BU tags wait for the daily check.** Fixing a skipped log group's BU tags doesn't trigger a run; the next full check picks it up. Run the function with `{}` to do it sooner.
 - **Tagging method matters for the instant triggers.** The rules match CloudWatch Logs' own tagging calls (`TagResource`, `TagLogGroup`, `CreateLogGroup` with tags, `UntagResource`, `UntagLogGroup`). Other tagging methods rely on the daily full check (and have no fallback for removal); test each method your teams use.
 - **The network lookup doesn't follow tag changes on its own.** Retagging subnets or security groups takes effect after you [re-run the lookup](#re-running-the-network-lookup).
 - **Public subnets aren't blocked.** Nothing stops a public subnet from carrying the subnet tag; runs there just time out.

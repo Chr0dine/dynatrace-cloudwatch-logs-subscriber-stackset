@@ -31,7 +31,6 @@ Metadata:
         Parameters:
           - TagKey
           - TagValue
-          - RequiredTagKeys
           - FirehoseNameContains
           - RoleNameContains
           - SubscriptionFilterName
@@ -67,8 +66,6 @@ Metadata:
         default: TAG_KEY
       TagValue:
         default: TAG_VALUE
-      RequiredTagKeys:
-        default: REQUIRED_TAG_KEYS
       FirehoseNameContains:
         default: FIREHOSE_NAME_CONTAINS
       RoleNameContains:
@@ -178,13 +175,6 @@ Parameters:
     Default: "true"
     MinLength: 1
     Description: Tag value that opts a log group in (case-sensitive).
-
-  RequiredTagKeys:
-    Type: String
-    Default: BU:ApplicationName,BU:GEARID,BU:SoftwareInstallationId
-    Description: >-
-      Comma-separated tag keys that must also be present with a non-blank
-      value. Key matching is case-insensitive. Leave empty to disable the check.
 
   FirehoseNameContains:
     Type: String
@@ -642,7 +632,6 @@ Resources:
         Variables:
           TAG_KEY: !Ref TagKey
           TAG_VALUE: !Ref TagValue
-          REQUIRED_TAG_KEYS: !Ref RequiredTagKeys
           FIREHOSE_NAME_CONTAINS: !Ref FirehoseNameContains
           ROLE_NAME_CONTAINS: !Ref RoleNameContains
           SUBSCRIPTION_FILTER_NAME: !Ref SubscriptionFilterName
@@ -700,88 +689,6 @@ Resources:
                   )
 
               return value.strip()
-
-
-          # Tags that must also be present (with a non-blank value) on a
-          # log group before it is subscribed. Overridable with the
-          # REQUIRED_TAG_KEYS environment variable (comma-separated).
-          DEFAULT_REQUIRED_TAG_KEYS = (
-              "BU:ApplicationName,"
-              "BU:GEARID,"
-              "BU:SoftwareInstallationId"
-          )
-
-
-          def parse_required_tag_keys(
-              raw_value,
-          ):
-              """
-              Converts a comma-separated list of tag keys into a list.
-
-              Blank entries and case-insensitive duplicates are dropped.
-              The first spelling of each key is kept for log messages.
-              An empty value disables the required-tag check.
-              """
-              required_tag_keys = []
-              seen_keys = set()
-
-              for tag_key in (raw_value or "").split(","):
-                  tag_key = tag_key.strip()
-
-                  if not tag_key:
-                      continue
-
-                  if tag_key.lower() in seen_keys:
-                      continue
-
-                  seen_keys.add(tag_key.lower())
-                  required_tag_keys.append(tag_key)
-
-              return required_tag_keys
-
-
-          def find_missing_required_tags(
-              resource_tags,
-              required_tag_keys,
-          ):
-              """
-              Returns the required tag keys that are absent or blank.
-
-              Tag-key matching is case-insensitive, so BU:GEARID,
-              BU:gearid and bu:GearId all satisfy BU:GEARID.
-
-              AWS tag keys are case-sensitive, so a single log group can
-              carry more than one spelling of the same key. The
-              requirement is met when any spelling has a non-blank value.
-              """
-              values_by_key = {}
-
-              for tag_key, tag_value in resource_tags.items():
-                  values_by_key.setdefault(
-                      tag_key.strip().lower(),
-                      [],
-                  ).append(tag_value)
-
-              missing_tag_keys = []
-
-              for required_tag_key in required_tag_keys:
-                  values = values_by_key.get(
-                      required_tag_key.lower(),
-                      [],
-                  )
-
-                  has_value = any(
-                      value is not None
-                      and str(value).strip()
-                      for value in values
-                  )
-
-                  if not has_value:
-                      missing_tag_keys.append(
-                          required_tag_key
-                      )
-
-              return missing_tag_keys
 
 
           def find_firehose_stream(
@@ -1135,22 +1042,10 @@ Resources:
                           )
                           continue
 
-                      resource_tags = {
-                          tag["Key"]: tag.get(
-                              "Value",
-                              "",
-                          )
-                          for tag in resource.get(
-                              "Tags",
-                              [],
-                          )
-                      }
-
                       matching_log_groups.append(
                           {
                               "logGroupName": log_group_name,
                               "arn": resource_arn,
-                              "tags": resource_tags,
                           }
                       )
 
@@ -1649,7 +1544,6 @@ Resources:
                       {
                           "logGroupName": log_group_name,
                           "arn": log_group_arn,
-                          "tags": resource_tags,
                       }
                   )
 
@@ -1713,13 +1607,6 @@ Resources:
                   "",
               )
 
-              required_tag_keys = parse_required_tag_keys(
-                  os.getenv(
-                      "REQUIRED_TAG_KEYS",
-                      DEFAULT_REQUIRED_TAG_KEYS,
-                  )
-              )
-
               unsubscribe = os.getenv(
                   "UNSUBSCRIBE_ON_TAG_REMOVAL",
                   "false",
@@ -1742,7 +1629,6 @@ Resources:
                   "updated": 0,
                   "exists": 0,
                   "skipped": 0,
-                  "missing_tags": 0,
                   "not_tagged": 0,
                   "unsubscribed": 0,
                   "errors": 0,
@@ -1761,11 +1647,6 @@ Resources:
                       if isinstance(event, dict)
                       else "direct invocation"
                   ),
-              )
-
-              logger.info(
-                  "Required tags (case-insensitive keys): %s",
-                  required_tag_keys or "none",
               )
 
               logger.info(
@@ -1858,32 +1739,6 @@ Resources:
                           "Processing tagged log group: %s",
                           log_group_name,
                       )
-
-                      missing_tag_keys = find_missing_required_tags(
-                          resource_tags=log_group["tags"],
-                          required_tag_keys=required_tag_keys,
-                      )
-
-                      if missing_tag_keys:
-                          logger.warning(
-                              "Skipping %s because these required tags "
-                              "are missing or empty: %s",
-                              log_group_name,
-                              missing_tag_keys,
-                          )
-
-                          results["missing_tags"] += 1
-
-                          results["details"].append(
-                              {
-                                  "logGroupName": log_group_name,
-                                  "logGroupArn": log_group_arn,
-                                  "status": "missing_tags",
-                                  "missingTags": missing_tag_keys,
-                              }
-                          )
-
-                          continue
 
                       status = create_or_update_subscription(
                           log_group_name=log_group_name,
