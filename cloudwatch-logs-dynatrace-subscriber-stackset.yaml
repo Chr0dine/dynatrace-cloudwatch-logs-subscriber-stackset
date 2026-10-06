@@ -3,7 +3,9 @@ Description: >-
   CloudWatch Logs -> Dynatrace Firehose subscriber Lambda, its execution role,
   a CloudTrail-based EventBridge trigger that subscribes a log group as soon
   as the opt-in tag is applied, and a daily full check of every tagged log
-  group. The function runs in the private VPC subnets you select.
+  group. Designed to be deployed as a StackSet: one stack instance per account
+  and region. When VPC networking is enabled, the function runs in the subnets
+  and security groups found by tag in each account and region.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -17,10 +19,13 @@ Metadata:
       - Label:
           default: VPC
         Parameters:
-          - VpcId
+          - EnableVpc
+          - SubnetTagKey
+          - SubnetTagValue
+          - SecurityGroupTagKey
+          - SecurityGroupTagValue
           - Ipv6AllowedForDualStack
-          - SubnetIds
-          - SecurityGroupIds
+          - NetworkLookupVersion
       - Label:
           default: Environment variables
         Parameters:
@@ -43,14 +48,20 @@ Metadata:
         default: Memory (MB)
       Timeout:
         default: Timeout (seconds)
-      VpcId:
-        default: VPC
+      EnableVpc:
+        default: Run the function in a VPC
+      SubnetTagKey:
+        default: Subnet tag key
+      SubnetTagValue:
+        default: Subnet tag value
+      SecurityGroupTagKey:
+        default: Security group tag key
+      SecurityGroupTagValue:
+        default: Security group tag value
       Ipv6AllowedForDualStack:
         default: Allow IPv6 traffic for dual-stack subnets
-      SubnetIds:
-        default: Subnets
-      SecurityGroupIds:
-        default: Security groups
+      NetworkLookupVersion:
+        default: Network lookup version
       TagKey:
         default: TAG_KEY
       TagValue:
@@ -93,9 +104,48 @@ Parameters:
     Description: Each run checks every tagged log group, so allow headroom.
 
   # ---------------------------------------------------------------- VPC
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Choose a VPC for the function to access.
+  EnableVpc:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true runs the function in the subnets and security groups found by the
+      tags below, looked up separately in every account and region the
+      StackSet deploys to. false runs it outside any VPC, using Lambda's own
+      internet access, and ignores the tag parameters.
+
+  SubnetTagKey:
+    Type: String
+    Default: ""
+    Description: >-
+      Tag key that marks the PRIVATE subnets for the function. Every matching
+      subnet is used, so tag at least two in different Availability Zones.
+      All matches must be in one VPC (at most 16). Do not tag public subnets
+      for this: a VPC Lambda never gets a public IP, so runs there time out.
+      The subnets need a NAT gateway route (or VPC endpoints) so the function
+      can reach the CloudWatch Logs, Firehose, IAM and tagging APIs.
+
+  SubnetTagValue:
+    Type: String
+    Default: ""
+    Description: >-
+      Tag value of those subnets (case-sensitive). * and ? work as wildcards,
+      so * matches any value.
+
+  SecurityGroupTagKey:
+    Type: String
+    Default: ""
+    Description: >-
+      Tag key that marks the security groups for the function. Only groups in
+      the subnets' VPC are used (at most 5). They must allow outbound HTTPS
+      (443).
+
+  SecurityGroupTagValue:
+    Type: String
+    Default: ""
+    Description: >-
+      Tag value of those security groups (case-sensitive). * and ? work as
+      wildcards.
 
   Ipv6AllowedForDualStack:
     Type: String
@@ -104,21 +154,13 @@ Parameters:
     Description: >-
       Lets outbound IPv6 traffic from the function use dual-stack subnets.
 
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
+  NetworkLookupVersion:
+    Type: String
+    Default: "1"
     Description: >-
-      Select the PRIVATE subnets (in the VPC above) for the function's network
-      interfaces. Choose at least two in different Availability Zones for high
-      availability. Do not select public subnets: a VPC Lambda never gets a
-      public IP, so runs in a public subnet time out. The subnets need a NAT
-      gateway route (or VPC endpoints) so the function can reach the CloudWatch
-      Logs, Firehose, IAM and tagging APIs.
-
-  SecurityGroupIds:
-    Type: List<AWS::EC2::SecurityGroup::Id>
-    Description: >-
-      Choose the security groups (in the VPC above) for the function. They must
-      allow outbound HTTPS (443).
+      The subnet and security group lookup runs when a stack instance is
+      created or its VPC parameters change. To pick up tag changes made
+      later, update the stack instances with any new value here.
 
   # ---------------------------------------------------------------- Env vars
   TagKey:
@@ -186,27 +228,317 @@ Parameters:
       skipped. Default is daily at 06:00 UTC. Leave empty to disable.
 
 Rules:
-  SubnetsMustBelongToSelectedVpc:
+  VpcTagsRequiredWhenVpcEnabled:
+    RuleCondition: !Equals [!Ref EnableVpc, "true"]
     Assertions:
-      - Assert:
-          Fn::EachMemberEquals:
-            - Fn::ValueOf: [SubnetIds, VpcId]
-            - !Ref VpcId
-        AssertDescription: Every selected subnet must belong to the selected VPC.
-
-  SecurityGroupsMustBelongToSelectedVpc:
-    Assertions:
-      - Assert:
-          Fn::EachMemberEquals:
-            - Fn::ValueOf: [SecurityGroupIds, VpcId]
-            - !Ref VpcId
-        AssertDescription: Every selected security group must belong to the selected VPC.
+      - Assert: !Not [!Equals [!Ref SubnetTagKey, ""]]
+        AssertDescription: Subnet tag key is required when the function runs in a VPC.
+      - Assert: !Not [!Equals [!Ref SubnetTagValue, ""]]
+        AssertDescription: Subnet tag value is required when the function runs in a VPC (use * for any value).
+      - Assert: !Not [!Equals [!Ref SecurityGroupTagKey, ""]]
+        AssertDescription: Security group tag key is required when the function runs in a VPC.
+      - Assert: !Not [!Equals [!Ref SecurityGroupTagValue, ""]]
+        AssertDescription: Security group tag value is required when the function runs in a VPC (use * for any value).
 
 Conditions:
+  UseVpc: !Equals [!Ref EnableVpc, "true"]
   AllowIpv6: !Equals [!Ref Ipv6AllowedForDualStack, "true"]
   HasFullCheckSchedule: !Not [!Equals [!Ref FullCheckSchedule, ""]]
 
 Resources:
+  # ======================================================================
+  # Network lookup (deploy time only)
+  # ======================================================================
+  # Finds the subnets and security groups tagged for the subscriber in this
+  # account and region, so one StackSet works across accounts whose subnet
+  # and security group IDs all differ. It runs only when the stack instance
+  # is created or the lookup properties below change, never per log event,
+  # and it runs outside any VPC so it doesn't depend on the network it is
+  # looking up.
+  NetworkLookupRole:
+    Type: AWS::IAM::Role
+    Condition: UseVpc
+    Properties:
+      Description: Execution role for the Dynatrace subscriber's deploy-time network lookup.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NetworkLookupPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DescribeNetwork
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+
+  NetworkLookupFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseVpc
+    Properties:
+      Description: !Sub Finds the tagged subnets and security groups for ${FunctionName} at deploy time.
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt NetworkLookupRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import urllib.request
+
+          import boto3
+
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2_client = boto3.client("ec2")
+
+          # Lambda VpcConfig limits.
+          MAX_SUBNETS = 16
+          MAX_SECURITY_GROUPS = 5
+
+
+          def describe_all(
+              operation,
+              result_key,
+              filters,
+          ):
+              paginator = ec2_client.get_paginator(operation)
+
+              items = []
+
+              for page in paginator.paginate(Filters=filters):
+                  items.extend(page.get(result_key, []))
+
+              return items
+
+
+          def find_network(
+              subnet_tag_key,
+              subnet_tag_value,
+              security_group_tag_key,
+              security_group_tag_value,
+          ):
+              """
+              Returns (vpc_id, subnet_ids, security_group_ids) for the
+              subnets and security groups carrying the given tags.
+
+              All matching subnets must be in one VPC. Security groups
+              are only matched in that VPC, so the same tag may be used
+              on groups in other VPCs.
+              """
+              subnets = describe_all(
+                  "describe_subnets",
+                  "Subnets",
+                  [
+                      {
+                          "Name": f"tag:{subnet_tag_key}",
+                          "Values": [subnet_tag_value],
+                      },
+                  ],
+              )
+
+              if not subnets:
+                  raise RuntimeError(
+                      "No subnet is tagged "
+                      f"{subnet_tag_key}={subnet_tag_value}"
+                  )
+
+              vpc_ids = sorted(
+                  {subnet["VpcId"] for subnet in subnets}
+              )
+
+              if len(vpc_ids) > 1:
+                  raise RuntimeError(
+                      "Subnets tagged "
+                      f"{subnet_tag_key}={subnet_tag_value} are in "
+                      f"more than one VPC: {vpc_ids}"
+                  )
+
+              if len(subnets) > MAX_SUBNETS:
+                  raise RuntimeError(
+                      f"{len(subnets)} subnets are tagged "
+                      f"{subnet_tag_key}={subnet_tag_value}; Lambda "
+                      f"accepts at most {MAX_SUBNETS}"
+                  )
+
+              vpc_id = vpc_ids[0]
+
+              availability_zones = {
+                  subnet["AvailabilityZone"] for subnet in subnets
+              }
+
+              if len(availability_zones) < 2:
+                  logger.warning(
+                      "All matching subnets are in %s; tag subnets in "
+                      "a second Availability Zone for high availability",
+                      sorted(availability_zones),
+                  )
+
+              security_groups = describe_all(
+                  "describe_security_groups",
+                  "SecurityGroups",
+                  [
+                      {
+                          "Name": f"tag:{security_group_tag_key}",
+                          "Values": [security_group_tag_value],
+                      },
+                      {
+                          "Name": "vpc-id",
+                          "Values": [vpc_id],
+                      },
+                  ],
+              )
+
+              if not security_groups:
+                  raise RuntimeError(
+                      "No security group in "
+                      f"{vpc_id} is tagged "
+                      f"{security_group_tag_key}="
+                      f"{security_group_tag_value}"
+                  )
+
+              if len(security_groups) > MAX_SECURITY_GROUPS:
+                  raise RuntimeError(
+                      f"{len(security_groups)} security groups in "
+                      f"{vpc_id} are tagged "
+                      f"{security_group_tag_key}="
+                      f"{security_group_tag_value}; Lambda accepts at "
+                      f"most {MAX_SECURITY_GROUPS}"
+                  )
+
+              # Sorted so an unchanged lookup never changes the
+              # subscriber's VpcConfig.
+              subnet_ids = sorted(
+                  subnet["SubnetId"] for subnet in subnets
+              )
+
+              security_group_ids = sorted(
+                  group["GroupId"] for group in security_groups
+              )
+
+              return vpc_id, subnet_ids, security_group_ids
+
+
+          def send_response(
+              event,
+              status,
+              data=None,
+              reason="",
+          ):
+              body = json.dumps(
+                  {
+                      "Status": status,
+                      "Reason": (
+                          reason
+                          or "See CloudWatch Logs for details"
+                      )[:1000],
+                      "PhysicalResourceId": (
+                          event.get("PhysicalResourceId")
+                          or "dynatrace-subscriber-network-lookup"
+                      ),
+                      "StackId": event["StackId"],
+                      "RequestId": event["RequestId"],
+                      "LogicalResourceId": event["LogicalResourceId"],
+                      "Data": data or {},
+                  }
+              ).encode()
+
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={
+                      "Content-Type": "",
+                      "Content-Length": str(len(body)),
+                  },
+              )
+
+              with urllib.request.urlopen(request, timeout=30):
+                  pass
+
+
+          def lambda_handler(
+              event,
+              context,
+          ):
+              logger.info(
+                  "%s request for %s",
+                  event.get("RequestType"),
+                  event.get("LogicalResourceId"),
+              )
+
+              # Nothing was created, so there is nothing to delete.
+              if event.get("RequestType") == "Delete":
+                  send_response(event, "SUCCESS")
+                  return
+
+              try:
+                  properties = event.get("ResourceProperties", {})
+
+                  vpc_id, subnet_ids, security_group_ids = find_network(
+                      subnet_tag_key=properties["SubnetTagKey"],
+                      subnet_tag_value=properties["SubnetTagValue"],
+                      security_group_tag_key=properties[
+                          "SecurityGroupTagKey"
+                      ],
+                      security_group_tag_value=properties[
+                          "SecurityGroupTagValue"
+                      ],
+                  )
+
+                  logger.info(
+                      "Found VPC %s, subnets %s, security groups %s",
+                      vpc_id,
+                      subnet_ids,
+                      security_group_ids,
+                  )
+
+                  send_response(
+                      event,
+                      "SUCCESS",
+                      data={
+                          "VpcId": vpc_id,
+                          "SubnetIds": ",".join(subnet_ids),
+                          "SecurityGroupIds": ",".join(
+                              security_group_ids
+                          ),
+                      },
+                  )
+
+              except Exception as error:
+                  logger.exception("Network lookup failed")
+
+                  send_response(
+                      event,
+                      "FAILED",
+                      reason=str(error),
+                  )
+
+  NetworkLookup:
+    Type: Custom::NetworkLookup
+    Condition: UseVpc
+    Properties:
+      ServiceToken: !GetAtt NetworkLookupFunction.Arn
+      SubnetTagKey: !Ref SubnetTagKey
+      SubnetTagValue: !Ref SubnetTagValue
+      SecurityGroupTagKey: !Ref SecurityGroupTagKey
+      SecurityGroupTagValue: !Ref SecurityGroupTagValue
+      # Changing this re-runs the lookup without changing any tags.
+      LookupVersion: !Ref NetworkLookupVersion
+
   # ======================================================================
   # Subscriber Lambda + execution role
   # ======================================================================
@@ -253,16 +585,19 @@ Resources:
                   - iam:PassRole
                 # Same string the function uses to find the role.
                 Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*${RoleNameContains}*
-              - Sid: ec2permissions
-                Effect: Allow
-                Action:
-                  - ec2:CreateNetworkInterface
-                  - ec2:DescribeNetworkInterfaces
-                  - ec2:DeleteNetworkInterface
-                  - ec2:DescribeSubnets
-                  - ec2:AssignPrivateIpAddresses
-                  - ec2:UnassignPrivateIpAddresses
-                Resource: "*"
+              - !If
+                - UseVpc
+                - Sid: ec2permissions
+                  Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                    - ec2:DescribeSubnets
+                    - ec2:AssignPrivateIpAddresses
+                    - ec2:UnassignPrivateIpAddresses
+                  Resource: "*"
+                - !Ref AWS::NoValue
               - Sid: FindResourcesByTag
                 Effect: Allow
                 Action:
@@ -283,10 +618,12 @@ Resources:
       # never race each other on the same log group.
       ReservedConcurrentExecutions: 1
       Role: !GetAtt SubscriberExecutionRole.Arn
-      VpcConfig:
-        SubnetIds: !Ref SubnetIds
-        SecurityGroupIds: !Ref SecurityGroupIds
-        Ipv6AllowedForDualStack: !If [AllowIpv6, true, false]
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Split [",", !GetAtt NetworkLookup.SubnetIds]
+          SecurityGroupIds: !Split [",", !GetAtt NetworkLookup.SecurityGroupIds]
+          Ipv6AllowedForDualStack: !If [AllowIpv6, true, false]
+        - !Ref AWS::NoValue
       Environment:
         Variables:
           TAG_KEY: !Ref TagKey
@@ -1552,6 +1889,15 @@ Resources:
       SourceArn: !GetAtt FullCheckRule.Arn
 
 Outputs:
+  VpcId:
+    Condition: UseVpc
+    Value: !GetAtt NetworkLookup.VpcId
+  SubnetIds:
+    Condition: UseVpc
+    Value: !GetAtt NetworkLookup.SubnetIds
+  SecurityGroupIds:
+    Condition: UseVpc
+    Value: !GetAtt NetworkLookup.SecurityGroupIds
   FunctionName:
     Value: !Ref SubscriberFunction
   FunctionArn:
