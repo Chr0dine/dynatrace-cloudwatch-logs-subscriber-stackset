@@ -36,6 +36,7 @@ Metadata:
           - RoleNameContains
           - SubscriptionFilterName
           - FilterPattern
+          - UnsubscribeOnTagRemoval
           - LogLevel
       - Label:
           default: Daily full check
@@ -76,6 +77,8 @@ Metadata:
         default: SUBSCRIPTION_FILTER_NAME
       FilterPattern:
         default: FILTER_PATTERN
+      UnsubscribeOnTagRemoval:
+        default: UNSUBSCRIBE_ON_TAG_REMOVAL
       LogLevel:
         default: LOG_LEVEL
       FullCheckSchedule:
@@ -209,6 +212,15 @@ Parameters:
     Default: ""
     Description: CloudWatch Logs filter pattern. Empty forwards all log events.
 
+  UnsubscribeOnTagRemoval:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true removes the managed subscription filter when the opt-in tag is
+      removed from a log group or changed to another value, so the tag stays
+      the single source of truth. false leaves existing subscriptions in place.
+
   LogLevel:
     Type: String
     Default: INFO
@@ -244,6 +256,7 @@ Conditions:
   UseVpc: !Equals [!Ref EnableVpc, "true"]
   AllowIpv6: !Equals [!Ref Ipv6AllowedForDualStack, "true"]
   HasFullCheckSchedule: !Not [!Equals [!Ref FullCheckSchedule, ""]]
+  UnsubscribeEnabled: !Equals [!Ref UnsubscribeOnTagRemoval, "true"]
 
 Resources:
   # ======================================================================
@@ -566,6 +579,7 @@ Resources:
                   - logs:DescribeLogGroups
                   - logs:DescribeSubscriptionFilters
                   - logs:PutSubscriptionFilter
+                  - logs:DeleteSubscriptionFilter
                   - logs:ListTagsForResource
                 Resource: "*"
               - Sid: FirehoseDiscovery
@@ -633,6 +647,7 @@ Resources:
           ROLE_NAME_CONTAINS: !Ref RoleNameContains
           SUBSCRIPTION_FILTER_NAME: !Ref SubscriptionFilterName
           FILTER_PATTERN: !Ref FilterPattern
+          UNSUBSCRIBE_ON_TAG_REMOVAL: !Ref UnsubscribeOnTagRemoval
           LOG_LEVEL: !Ref LogLevel
       Code:
         ZipFile: |
@@ -1264,6 +1279,48 @@ Resources:
               return "created"
 
 
+          def remove_managed_subscription(
+              log_group_name,
+              filter_name,
+          ):
+              """
+              Deletes the managed subscription filter from a log group
+              that is no longer opted in. Filters with any other name are
+              left alone.
+
+              Returns "unsubscribed", or "not_tagged" when there was no
+              managed filter (or no log group) to remove.
+              """
+              try:
+                  logs_client.delete_subscription_filter(
+                      logGroupName=log_group_name,
+                      filterName=filter_name,
+                  )
+
+              except ClientError as error:
+                  error_code = error.response.get(
+                      "Error",
+                      {},
+                  ).get("Code")
+
+                  if error_code != "ResourceNotFoundException":
+                      raise
+
+                  logger.info(
+                      "No managed subscription to remove on %s",
+                      log_group_name,
+                  )
+
+                  return "not_tagged"
+
+              logger.info(
+                  "Removed subscription from %s",
+                  log_group_name,
+              )
+
+              return "unsubscribed"
+
+
           # Firehose and IAM role lookups are cached between invocations
           # that reuse the same warm Lambda instance. With reserved
           # concurrency of 1, queued runs from bulk tagging all reuse one
@@ -1345,7 +1402,9 @@ Resources:
               a list of {"logGroupName", "arn"} dicts:
 
                 TagResource     -> requestParameters.resourceArn
+                UntagResource   -> requestParameters.resourceArn
                 TagLogGroup     -> requestParameters.logGroupName
+                UntagLogGroup   -> requestParameters.logGroupName
                 CreateLogGroup  -> requestParameters.logGroupName
 
               Returns None for anything that is not a CloudTrail event
@@ -1419,10 +1478,49 @@ Resources:
               return None
 
 
+          def record_aws_error(
+              results,
+              log_group_name,
+              log_group_arn,
+              error,
+              action,
+          ):
+              aws_error = error.response.get(
+                  "Error",
+                  {},
+              )
+
+              results["errors"] += 1
+
+              logger.exception(
+                  "AWS error %s %s",
+                  action,
+                  log_group_name,
+              )
+
+              results["details"].append(
+                  {
+                      "logGroupName": log_group_name,
+                      "logGroupArn": log_group_arn,
+                      "status": "error",
+                      "errorCode": aws_error.get(
+                          "Code",
+                          "Unknown",
+                      ),
+                      "error": aws_error.get(
+                          "Message",
+                          str(error),
+                      ),
+                  }
+              )
+
+
           def get_event_log_groups(
               targets,
               tag_key,
               tag_value,
+              filter_name,
+              unsubscribe,
               results,
           ):
               """
@@ -1431,6 +1529,12 @@ Resources:
 
               Tags are read fresh rather than taken from the event, so a
               tag that was removed again before this run is respected.
+              The decision follows the log group's current tags, not the
+              kind of event, so a quick tag-then-untag (or the reverse)
+              always ends in the right state whatever order runs happen.
+
+              When unsubscribe is True, a log group that is no longer
+              tagged has its managed subscription filter removed here.
               """
               log_groups = []
 
@@ -1473,24 +1577,12 @@ Resources:
 
                           continue
 
-                      results["errors"] += 1
-
-                      logger.exception(
-                          "AWS error reading tags for %s",
-                          log_group_name,
-                      )
-
-                      results["details"].append(
-                          {
-                              "logGroupName": log_group_name,
-                              "logGroupArn": log_group_arn,
-                              "status": "error",
-                              "errorCode": error_code,
-                              "error": aws_error.get(
-                                  "Message",
-                                  str(error),
-                              ),
-                          }
+                      record_aws_error(
+                          results=results,
+                          log_group_name=log_group_name,
+                          log_group_arn=log_group_arn,
+                          error=error,
+                          action="reading tags for",
                       )
 
                       continue
@@ -1501,21 +1593,50 @@ Resources:
                   )
 
                   if resource_tags.get(tag_key) != tag_value:
-                      logger.info(
-                          "Ignoring %s because it is no longer "
-                          "tagged %s=%s",
-                          log_group_name,
-                          tag_key,
-                          tag_value,
-                      )
+                      status = "not_tagged"
 
-                      results["not_tagged"] += 1
+                      if unsubscribe:
+                          logger.info(
+                              "%s is no longer tagged %s=%s; "
+                              "removing its managed subscription",
+                              log_group_name,
+                              tag_key,
+                              tag_value,
+                          )
+
+                          try:
+                              status = remove_managed_subscription(
+                                  log_group_name=log_group_name,
+                                  filter_name=filter_name,
+                              )
+
+                          except ClientError as error:
+                              record_aws_error(
+                                  results=results,
+                                  log_group_name=log_group_name,
+                                  log_group_arn=log_group_arn,
+                                  error=error,
+                                  action="unsubscribing",
+                              )
+
+                              continue
+
+                      else:
+                          logger.info(
+                              "Ignoring %s because it is no longer "
+                              "tagged %s=%s",
+                              log_group_name,
+                              tag_key,
+                              tag_value,
+                          )
+
+                      results[status] += 1
 
                       results["details"].append(
                           {
                               "logGroupName": log_group_name,
                               "logGroupArn": log_group_arn,
-                              "status": "not_tagged",
+                              "status": status,
                               "reason": (
                                   f"not tagged {tag_key}={tag_value}"
                               ),
@@ -1599,6 +1720,11 @@ Resources:
                   )
               )
 
+              unsubscribe = os.getenv(
+                  "UNSUBSCRIBE_ON_TAG_REMOVAL",
+                  "false",
+              ).strip().lower() == "true"
+
               targets = log_group_targets_from_event(
                   event,
                   context,
@@ -1618,6 +1744,7 @@ Resources:
                   "skipped": 0,
                   "missing_tags": 0,
                   "not_tagged": 0,
+                  "unsubscribed": 0,
                   "errors": 0,
                   "details": [],
               }
@@ -1639,6 +1766,11 @@ Resources:
               logger.info(
                   "Required tags (case-insensitive keys): %s",
                   required_tag_keys or "none",
+              )
+
+              logger.info(
+                  "Unsubscribe on tag removal: %s",
+                  unsubscribe,
               )
 
               if mode == "full":
@@ -1667,6 +1799,8 @@ Resources:
                       targets=targets,
                       tag_key=tag_key,
                       tag_value=tag_value,
+                      filter_name=filter_name,
+                      unsubscribe=unsubscribe,
                       results=results,
                   )
 
@@ -1863,6 +1997,64 @@ Resources:
       SourceArn: !GetAtt CloudTrailTagRule.Arn
 
   # ======================================================================
+  # EventBridge removal trigger (CloudTrail)
+  # ======================================================================
+  # Fires when TAG_KEY is removed from a log group (UntagResource, or the
+  # legacy UntagLogGroup) or re-tagged with a value other than TAG_VALUE.
+  # The function re-reads the log group's tags and, if it is no longer opted
+  # in, deletes the managed subscription filter.
+  CloudTrailUntagRule:
+    Type: AWS::Events::Rule
+    Condition: UnsubscribeEnabled
+    Properties:
+      Description: !Sub Runs ${FunctionName} when ${TagKey}=${TagValue} is removed from a log group.
+      State: ENABLED
+      EventPattern: !Sub |
+        {
+          "source": ["aws.logs"],
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventSource": ["logs.amazonaws.com"],
+            "errorCode": [{"exists": false}],
+            "$or": [
+              {
+                "eventName": ["UntagResource"],
+                "requestParameters": {
+                  "tagKeys": ["${TagKey}"]
+                }
+              },
+              {
+                "eventName": ["UntagLogGroup"],
+                "requestParameters": {
+                  "tags": ["${TagKey}"]
+                }
+              },
+              {
+                "eventName": ["TagResource", "TagLogGroup"],
+                "requestParameters": {
+                  "tags": {
+                    "${TagKey}": [{"anything-but": "${TagValue}"}]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      Targets:
+        - Id: SubscriberFunction
+          Arn: !GetAtt SubscriberFunction.Arn
+
+  CloudTrailUntagRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: UnsubscribeEnabled
+    Properties:
+      FunctionName: !Ref SubscriberFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt CloudTrailUntagRule.Arn
+
+  # ======================================================================
   # Daily full check
   # ======================================================================
   # A scheduled event (no CloudTrail detail) makes the function check every
@@ -1906,6 +2098,9 @@ Outputs:
     Value: !GetAtt SubscriberExecutionRole.Arn
   CloudTrailTagRuleArn:
     Value: !GetAtt CloudTrailTagRule.Arn
+  CloudTrailUntagRuleArn:
+    Condition: UnsubscribeEnabled
+    Value: !GetAtt CloudTrailUntagRule.Arn
   FullCheckRuleArn:
     Condition: HasFullCheckSchedule
     Value: !GetAtt FullCheckRule.Arn
