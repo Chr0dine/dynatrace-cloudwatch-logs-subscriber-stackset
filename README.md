@@ -1,8 +1,10 @@
 # CloudWatch Logs → Dynatrace Subscriber (StackSet)
 
-A CloudFormation template, deployed as a **StackSet**, that automatically subscribes CloudWatch log groups to the Dynatrace Firehose delivery stream when they are tagged for monitoring, and unsubscribes them when the tag is removed.
+CloudFormation templates that automatically subscribes CloudWatch log groups to the Dynatrace Firehose delivery stream when they are tagged for monitoring, and unsubscribes them when the tag is removed.
 
 When someone applies the opt-in tag (for example `SendLogToDynatrace=true`) to a log group, CloudTrail records the call, an EventBridge rule picks it up, and a Lambda function subscribes **that log group**. Removing the tag (or changing its value) triggers the same function to remove the subscription again, so the tag stays the single source of truth. A daily full check also reviews every tagged log group, catching any whose tagging event was missed.
+
+There are two templates: a **StackSet** for rolling the subscriber out across many accounts, and a **standalone stack** for a single account, such as a central logging account. Most of this README describes the StackSet; the standalone stack is covered in [Standalone stack](#standalone-stack).
 
 You choose the organizational units (OUs) and regions when you deploy the StackSet. Each account and region gets one stack instance. When VPC networking is enabled, each instance finds its own subnets and security groups by tag, so one set of parameters works across accounts whose network IDs all differ.
 
@@ -10,7 +12,17 @@ You choose the organizational units (OUs) and regions when you deploy the StackS
 
 | File | Purpose |
 | --- | --- |
-| `cloudwatch-logs-dynatrace-subscriber-stackset.yaml` | The CloudFormation template. Both Lambda functions' code is inline in this file, and this is the copy that gets deployed. |
+| `cloudwatch-logs-dynatrace-subscriber-stackset.yaml` | The StackSet template. Both Lambda functions' code is inline in this file, and this is the copy that gets deployed. |
+| `cloudwatch-logs-dynatrace-subscriber.yaml` | The standalone stack template, for one account at a time. The subscriber code is inline in this file. |
+
+## Choosing a template
+
+| Use | When |
+| --- | --- |
+| **StackSet** | Log groups live in many accounts across your AWS Organization, and each account (and region) has its own Dynatrace Firehose stream and CloudWatch Logs role. One deployment covers every account in the chosen OUs, including accounts that join them later. |
+| **Standalone stack** | You already centralize CloudWatch logs in one logging account, so only that account needs the subscriber. Also use it for the Organizations management account (service-managed StackSets never deploy there), for an account outside AWS Organizations, or to try the subscriber out in one account before rolling out the StackSet. |
+
+Don't use both in the same account and region: the second deployment fails on the function name (see [Deployment model](#deployment-model-one-stack-instance-per-account-and-region)).
 
 ## Deployment model: one stack instance per account and region
 
@@ -326,6 +338,77 @@ The code that runs is the inline copy in the template's `SubscriberFunction` →
 | `Could not find a log group in the CloudTrail event` warning | Unexpected event shape | The function falls back to a full check automatically. |
 | Stack instance fails on `ReservedConcurrentExecutions` | Account concurrency limit too low in that region | Request a limit increase. |
 
+## Standalone stack
+
+`cloudwatch-logs-dynatrace-subscriber.yaml` deploys the same subscriber as a normal CloudFormation stack in one account and region. Deploy one stack per region that has a Dynatrace Firehose stream. Everything in [How it works](#how-it-works), [Matching rules](#matching-rules), [Operations](#operations) and [Troubleshooting](#troubleshooting) applies, apart from the differences below.
+
+### Differences from the StackSet
+
+| | StackSet | Standalone stack |
+| --- | --- | --- |
+| Network | Subnets and security groups found by tag in each account, by a deploy-time lookup function | Subnet and security group IDs entered directly; no lookup function |
+| No VPC | Set **Run the function in a VPC** to `false` | Leave **Subnets** and **Security groups** empty |
+| Unsubscribe on tag removal | Yes (`UNSUBSCRIBE_ON_TAG_REMOVAL`) | No. Removing the opt-in tag leaves the subscription in place; delete the filter manually. There is no untag rule. |
+| Results | Includes `unsubscribed` | No `unsubscribed` status; `not_tagged` means the log group is no longer opted in |
+| Template size | About 64 KB (CLI must use S3) | About 47 KB (CLI can pass it inline) |
+
+### Running with or without a VPC
+
+- **In a VPC:** enter the private subnet IDs and the security group IDs, comma-separated. They must all be in one VPC; Lambda rejects a mix when the function is created. The same network requirements as the StackSet apply: a NAT gateway route (or VPC endpoints), and outbound HTTPS (443) allowed.
+- **Outside any VPC:** leave both empty. The function uses Lambda's own internet access and its role gets no EC2 network-interface permissions. Use this in an account that has no VPC.
+
+Fill in both or neither. Entering only one of them fails the stack on submit, before anything is created, with a message saying which is missing.
+
+### Parameters
+
+The **Function**, **Environment variables** and **Daily full check** parameters are the same as the StackSet's (see [Parameters](#parameters)), except that there is no `UNSUBSCRIBE_ON_TAG_REMOVAL`. The VPC section is:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| Subnets (`SubnetIds`) | empty | Comma-separated private subnet IDs, ideally two or more in different Availability Zones. Empty runs the function outside any VPC. |
+| Security groups (`SecurityGroupIds`) | empty | Comma-separated security group IDs in the subnets' VPC. Empty runs the function outside any VPC. |
+| Allow IPv6 traffic for dual-stack subnets | `false` | Set to `true` only if the subnets are dual-stack. Ignored outside a VPC. |
+
+### Prerequisites
+
+The same as the StackSet's [Prerequisites](#prerequisites), for the one account and each region you deploy to, minus the StackSets and Organizations requirements: CloudTrail recording write management events, exactly one matching Firehose stream and CloudWatch Logs role, the network (if you use a VPC), no existing subscriber with the same function name, and at least 100 unreserved concurrent executions.
+
+### Deploying
+
+#### Console
+
+1. In the target account and region, go to CloudFormation → **Stacks** → **Create stack** → **With new resources (standard)**.
+2. Choose **Upload a template file** and pick `cloudwatch-logs-dynatrace-subscriber.yaml`.
+3. Enter a stack name and fill in the parameters. Leave **Subnets** and **Security groups** empty to run outside a VPC.
+4. Tick **I acknowledge that AWS CloudFormation might create IAM resources** and submit.
+5. Repeat in each region that has a Dynatrace Firehose stream.
+
+#### CLI
+
+```bash
+aws cloudformation deploy \
+  --stack-name cwlogs-dynatrace-subscriber \
+  --template-file cloudwatch-logs-dynatrace-subscriber.yaml \
+  --region us-east-1 \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    TagKey=SendLogToDynatrace \
+    FirehoseNameContains=<text> \
+    RoleNameContains=<ExactCaseText> \
+    SubnetIds=subnet-aaaa,subnet-bbbb \
+    SecurityGroupIds=sg-cccc
+```
+
+Omit the `SubnetIds` and `SecurityGroupIds` lines to run outside a VPC. `aws cloudformation deploy` creates the stack the first time and updates it on later runs, keeping any parameters you don't pass. Run it once per region, changing `--region`.
+
+### After deploying
+
+Follow [After deploying](#after-deploying) steps 2 and 3 (backfill and test the trigger). Skip the network lookup check: the stack's VPC settings are exactly what you entered. Skip the removal test: the standalone stack doesn't unsubscribe.
+
+### Updating
+
+Update the stack with the edited template or new parameter values (`aws cloudformation deploy` again, or **Update** in the console). Switching between a VPC and no VPC is a normal stack update.
+
 ## Limitations
 
 - **Unsubscribing is event-driven only.** The daily full check adds missing subscriptions but doesn't look for subscriptions to remove: that would mean checking the filters on every log group in the account, every day. A removal missed by the untag rule (tag removed through Tag Editor or the Resource Groups Tagging API, CloudTrail gap, or a run dropped after retries) leaves the subscription in place. Re-apply and remove the tag with `aws logs` to retry it.
@@ -336,3 +419,4 @@ The code that runs is the inline copy in the template's `SubscriberFunction` →
 - **Firehose or role changes can take up to 15 minutes** to reach targeted checks because of the lookup cache. The next full check, or any failed run, refreshes it immediately.
 - **Runs are serialized.** Reserved concurrency of 1 means bulk tagging queues runs; each is short, so a few hundred clear in minutes.
 - **Stack instance deletion can be slow** while Lambda releases its VPC network interfaces.
+- **The standalone stack doesn't unsubscribe.** Removing the opt-in tag leaves the subscription filter in place. Use the StackSet template if you need removal.
