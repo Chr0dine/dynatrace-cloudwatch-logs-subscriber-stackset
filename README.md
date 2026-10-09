@@ -14,6 +14,7 @@ You choose the organizational units (OUs) and regions when you deploy the StackS
 | --- | --- |
 | `cloudwatch-logs-dynatrace-subscriber-stackset.yaml` | The StackSet template. Both Lambda functions' code is inline in this file, and this is the copy that gets deployed. |
 | `cloudwatch-logs-dynatrace-subscriber.yaml` | The standalone stack template, for one account at a time. The subscriber code is inline in this file. |
+| `bu-tags/cloudwatch-logs-dynatrace-subscriber-bu-tags.yaml` | The standalone stack template with a required business-tag check: log groups are only subscribed if they also carry the `BU:` tags. See [Standalone stack with required BU tags](#standalone-stack-with-required-bu-tags). |
 
 ## Choosing a template
 
@@ -21,6 +22,8 @@ You choose the organizational units (OUs) and regions when you deploy the StackS
 | --- | --- |
 | **StackSet** | Log groups live in many accounts across your AWS Organization, and each account (and region) has its own Dynatrace Firehose stream and CloudWatch Logs role. One deployment covers every account in the chosen OUs, including accounts that join them later. |
 | **Standalone stack** | You already centralize CloudWatch logs in one logging account, so only that account needs the subscriber. Also use it for the Organizations management account (service-managed StackSets never deploy there), for an account outside AWS Organizations, or to try the subscriber out in one account before rolling out the StackSet. |
+
+If log groups must also carry business tags before they're sent to Dynatrace, use the standalone stack in `bu-tags/` instead of the plain one.
 
 Don't use both in the same account and region: the second deployment fails on the function name (see [Deployment model](#deployment-model-one-stack-instance-per-account-and-region)).
 
@@ -408,6 +411,77 @@ Follow [After deploying](#after-deploying) steps 2 and 3 (backfill and test the 
 ### Updating
 
 Update the stack with the edited template or new parameter values (`aws cloudformation deploy` again, or **Update** in the console). Switching between a VPC and no VPC is a normal stack update.
+
+### Standalone stack with required BU tags
+
+`bu-tags/cloudwatch-logs-dynatrace-subscriber-bu-tags.yaml` is the standalone stack with one addition: a log group is only subscribed if, as well as the opt-in tag, it carries every required business tag with a non-blank value. By default those are `BU:ApplicationName`, `BU:GEARID` and `BU:SoftwareInstallationId`. Everything else (VPC or no VPC, parameters, triggers, deployment) is the same as the plain standalone stack.
+
+#### How the check works
+
+After the function finds a log group tagged `TAG_KEY=TAG_VALUE` (in either a targeted or a full check), it compares the log group's tags with the `REQUIRED_TAG_KEYS` list before touching its subscription:
+
+```
+Tagged log group
+    │
+    ├─ 1. Every key in REQUIRED_TAG_KEYS present with a non-blank value?
+    │       no  → skip it, report it as missing_tags, log which tags are missing
+    │       yes ↓
+    ├─ 2. Find the Dynatrace Firehose stream and IAM role
+    └─ 3. Create or update the subscription filter
+```
+
+| Rule | Detail |
+| --- | --- |
+| Key matching | Case-insensitive, so `BU:GEARID`, `BU:gearid` and `bu:GearId` all satisfy `BU:GEARID`. If a log group has several spellings of the same key, any one with a value counts. |
+| Values | Must be non-blank. A tag whose value is empty or only spaces counts as missing. Any non-blank value is accepted. |
+| Which tags are read | In a targeted check, the log group's current tags, read fresh when the function runs. In a full check, the tags returned by the Resource Groups Tagging API search. |
+| Disabling | Leave `REQUIRED_TAG_KEYS` empty to turn the check off, which makes the template behave like the plain standalone stack. |
+
+#### Extra parameter
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `REQUIRED_TAG_KEYS` | `BU:ApplicationName,BU:GEARID,BU:SoftwareInstallationId` | Comma-separated tag keys. Case-insensitive keys, values must be non-blank. Blank entries and duplicates are ignored. Leave empty to disable the check. |
+
+#### Extra result status
+
+| Status | Meaning |
+| --- | --- |
+| `missing_tags` | Skipped because one or more required tags are missing or blank. The run's `details` entry lists them under `missingTags`, and the function logs a warning naming them. |
+
+#### Deploying
+
+Follow [Deploying](#deploying) for the standalone stack, picking `bu-tags/cloudwatch-logs-dynatrace-subscriber-bu-tags.yaml`. This template is about 51.6 KB, just over the 51,200-byte limit for passing a template inline, so the CLI needs an S3 bucket to stage it (the console handles this automatically):
+
+```bash
+aws cloudformation deploy \
+  --stack-name cwlogs-dynatrace-subscriber \
+  --template-file bu-tags/cloudwatch-logs-dynatrace-subscriber-bu-tags.yaml \
+  --s3-bucket <bucket-in-the-same-region> \
+  --region us-east-1 \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    TagKey=SendLogToDynatrace \
+    FirehoseNameContains=<text> \
+    RoleNameContains=<ExactCaseText> \
+    SubnetIds=subnet-aaaa,subnet-bbbb \
+    SecurityGroupIds=sg-cccc
+```
+
+`RequiredTagKeys` keeps its default unless you add `RequiredTagKeys=<key1>,<key2>` to the overrides.
+
+#### Testing the check
+
+After the [standard checks](#after-deploying-1), tag a test log group that has all the required tags; it should be subscribed. Then tag one that's missing a `BU:` tag; the function should log `Skipping NAME because these required tags are missing or empty: [...]` and report it as `missing_tags`.
+
+#### Behaviour to know about
+
+- **Apply the BU tags before (or with) the opt-in tag.** If the opt-in tag goes on first, that run skips the log group, and adding the BU tags afterwards doesn't trigger another run. The next daily full check subscribes it; run the function with `{}` to do it sooner.
+- **Removing a BU tag doesn't unsubscribe.** A subscribed log group that later loses a required tag stays subscribed.
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Log group reported as `missing_tags` | One or more required tags missing or blank | Add the tags. The next daily full check subscribes it, or run the function manually with `{}`. |
 
 ## Limitations
 

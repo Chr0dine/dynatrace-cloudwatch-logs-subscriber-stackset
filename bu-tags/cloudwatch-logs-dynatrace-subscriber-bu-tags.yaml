@@ -1,0 +1,1583 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudWatch Logs -> Dynatrace Firehose subscriber Lambda, its execution role,
+  a CloudTrail-based EventBridge trigger that subscribes a log group as soon
+  as the opt-in tag is applied, and a daily full check of every tagged log
+  group. The function runs in the private VPC subnets you enter, or outside
+  any VPC when you leave the subnets and security groups empty.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Function
+        Parameters:
+          - FunctionName
+          - MemorySize
+          - Timeout
+      - Label:
+          default: VPC
+        Parameters:
+          - SubnetIds
+          - SecurityGroupIds
+          - Ipv6AllowedForDualStack
+      - Label:
+          default: Environment variables
+        Parameters:
+          - TagKey
+          - TagValue
+          - RequiredTagKeys
+          - FirehoseNameContains
+          - RoleNameContains
+          - SubscriptionFilterName
+          - FilterPattern
+          - LogLevel
+      - Label:
+          default: Daily full check
+        Parameters:
+          - FullCheckSchedule
+    ParameterLabels:
+      FunctionName:
+        default: Function name
+      MemorySize:
+        default: Memory (MB)
+      Timeout:
+        default: Timeout (seconds)
+      Ipv6AllowedForDualStack:
+        default: Allow IPv6 traffic for dual-stack subnets
+      SubnetIds:
+        default: Subnets
+      SecurityGroupIds:
+        default: Security groups
+      TagKey:
+        default: TAG_KEY
+      TagValue:
+        default: TAG_VALUE
+      RequiredTagKeys:
+        default: REQUIRED_TAG_KEYS
+      FirehoseNameContains:
+        default: FIREHOSE_NAME_CONTAINS
+      RoleNameContains:
+        default: ROLE_NAME_CONTAINS
+      SubscriptionFilterName:
+        default: SUBSCRIPTION_FILTER_NAME
+      FilterPattern:
+        default: FILTER_PATTERN
+      LogLevel:
+        default: LOG_LEVEL
+      FullCheckSchedule:
+        default: Schedule (UTC)
+
+Parameters:
+  # ---------------------------------------------------------------- Function
+  FunctionName:
+    Type: String
+    Default: CloudWatch-Logs-Dynatrace-Subscriber
+    AllowedPattern: "^[a-zA-Z0-9_-]{1,64}$"
+    ConstraintDescription: 1-64 letters, numbers, hyphens or underscores.
+    Description: Name of the Lambda function (unique per region).
+
+  MemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+
+  Timeout:
+    Type: Number
+    Default: 300
+    MinValue: 3
+    MaxValue: 900
+    Description: Each run checks every tagged log group, so allow headroom.
+
+  # ---------------------------------------------------------------- VPC
+  # Plain string lists rather than the AWS::EC2 parameter types: those can't
+  # be left empty, so the stack couldn't deploy in an account with no VPC.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Comma-separated IDs of the PRIVATE subnets for the function's network
+      interfaces, all in one VPC. Use at least two in different Availability
+      Zones. Do not use public subnets: a VPC Lambda never gets a public IP,
+      so runs there time out. The subnets need a NAT gateway route (or VPC
+      endpoints) so the function can reach the CloudWatch Logs, Firehose, IAM
+      and tagging APIs. Leave this and Security groups empty to run the
+      function outside any VPC (for example, in an account with no VPC).
+
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Comma-separated IDs of the security groups for the function, in the
+      subnets' VPC. They must allow outbound HTTPS (443). Leave empty together
+      with Subnets to run the function outside any VPC.
+
+  Ipv6AllowedForDualStack:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+    Description: >-
+      Lets outbound IPv6 traffic from the function use dual-stack subnets.
+      Ignored when the function runs outside a VPC.
+
+  # ---------------------------------------------------------------- Env vars
+  TagKey:
+    Type: String
+    MinLength: 1
+    Description: >-
+      Tag key that opts a log group in (case-sensitive). The EventBridge
+      trigger watches for this same key being applied.
+
+  TagValue:
+    Type: String
+    Default: "true"
+    MinLength: 1
+    Description: Tag value that opts a log group in (case-sensitive).
+
+  RequiredTagKeys:
+    Type: String
+    Default: BU:ApplicationName,BU:GEARID,BU:SoftwareInstallationId
+    Description: >-
+      Comma-separated tag keys that must also be present with a non-blank
+      value. Key matching is case-insensitive. Leave empty to disable the check.
+
+  FirehoseNameContains:
+    Type: String
+    MinLength: 1
+    Description: >-
+      Text the Dynatrace Firehose delivery stream name contains (the stream
+      name must also contain the region).
+
+  RoleNameContains:
+    Type: String
+    MinLength: 1
+    Description: >-
+      Text the CloudWatch Logs -> Firehose IAM role name contains (the role
+      name must also contain the region and trust logs.amazonaws.com). Also
+      scopes the function's iam:PassRole permission, which matches case-
+      sensitively, so enter it with the exact capitalization of the role name.
+
+  SubscriptionFilterName:
+    Type: String
+    Default: DynatraceManagedSubscription
+    MinLength: 1
+
+  FilterPattern:
+    Type: String
+    Default: ""
+    Description: CloudWatch Logs filter pattern. Empty forwards all log events.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: >-
+      How much the function writes to its CloudWatch log. INFO logs each log
+      group processed; WARNING only skips and errors; ERROR only errors; DEBUG
+      adds the AWS SDK's own request-level logging (very verbose).
+
+  # ---------------------------------------------------------------- Daily full check
+  FullCheckSchedule:
+    Type: String
+    Default: cron(0 6 * * ? *)
+    Description: >-
+      EventBridge schedule expression (UTC) for the full check of every tagged
+      log group, which picks up groups whose BU tags were fixed after they were
+      skipped. Default is daily at 06:00 UTC. Leave empty to disable.
+
+Rules:
+  # Subnets and security groups go together: both empty (no VPC) or both
+  # filled in. Lambda itself rejects subnets and security groups from
+  # different VPCs when the function is created.
+  SecurityGroupsRequireSubnets:
+    RuleCondition:
+      Fn::EachMemberIn: [!Ref SubnetIds, [""]]
+    Assertions:
+      - Assert:
+          Fn::EachMemberIn: [!Ref SecurityGroupIds, [""]]
+        AssertDescription: >-
+          Security groups were entered without subnets. Enter both to run the
+          function in a VPC, or leave both empty to run it outside any VPC.
+
+  SubnetsRequireSecurityGroups:
+    RuleCondition:
+      Fn::EachMemberIn: [!Ref SecurityGroupIds, [""]]
+    Assertions:
+      - Assert:
+          Fn::EachMemberIn: [!Ref SubnetIds, [""]]
+        AssertDescription: >-
+          Subnets were entered without security groups. Enter both to run the
+          function in a VPC, or leave both empty to run it outside any VPC.
+
+Conditions:
+  UseVpc: !And
+    - !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+    - !Not [!Equals [!Join ["", !Ref SecurityGroupIds], ""]]
+  AllowIpv6: !Equals [!Ref Ipv6AllowedForDualStack, "true"]
+  HasFullCheckSchedule: !Not [!Equals [!Ref FullCheckSchedule, ""]]
+
+Resources:
+  # ======================================================================
+  # Subscriber Lambda + execution role
+  # ======================================================================
+  SubscriberExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the CloudWatch Logs Dynatrace subscriber Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSLambdaExecute
+      Policies:
+        - PolicyName: CloudWatchLogsSubscriberPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogsDiscovery
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeSubscriptionFilters
+                  - logs:PutSubscriptionFilter
+                  - logs:ListTagsForResource
+                Resource: "*"
+              - Sid: FirehoseDiscovery
+                Effect: Allow
+                Action:
+                  - firehose:ListDeliveryStreams
+                  - firehose:DescribeDeliveryStream
+                Resource: "*"
+              - Sid: RoleDiscovery
+                Effect: Allow
+                Action:
+                  - iam:ListRoles
+                Resource: "*"
+              - Sid: PassLogsRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                # Same string the function uses to find the role.
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*${RoleNameContains}*
+              - !If
+                - UseVpc
+                - Sid: ec2permissions
+                  Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                    - ec2:DescribeSubnets
+                    - ec2:AssignPrivateIpAddresses
+                    - ec2:UnassignPrivateIpAddresses
+                  Resource: "*"
+                - !Ref AWS::NoValue
+              - Sid: FindResourcesByTag
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                Resource: "*"
+
+  SubscriberFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: Subscribes tagged CloudWatch log groups to the Dynatrace Firehose delivery stream.
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      # One run at a time. Bulk tagging queues short targeted runs on a single
+      # warm instance, so the cached Firehose/role lookups are reused and runs
+      # never race each other on the same log group.
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt SubscriberExecutionRole.Arn
+      # Outside any VPC (Lambda's own internet access) when no subnets and
+      # security groups are given.
+      VpcConfig: !If
+        - UseVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds: !Ref SecurityGroupIds
+          Ipv6AllowedForDualStack: !If [AllowIpv6, true, false]
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+          REQUIRED_TAG_KEYS: !Ref RequiredTagKeys
+          FIREHOSE_NAME_CONTAINS: !Ref FirehoseNameContains
+          ROLE_NAME_CONTAINS: !Ref RoleNameContains
+          SUBSCRIPTION_FILTER_NAME: !Ref SubscriptionFilterName
+          FILTER_PATTERN: !Ref FilterPattern
+          LOG_LEVEL: !Ref LogLevel
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import time
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+
+          logger = logging.getLogger()
+          logger.setLevel(
+              os.getenv("LOG_LEVEL", "INFO").upper()
+          )
+
+
+          # Lambda automatically sets AWS_REGION.
+          AWS_REGION = os.environ["AWS_REGION"]
+
+
+          # Regional clients. These clients operate in the same region
+          # where the Lambda function is deployed.
+          logs_client = boto3.client(
+              "logs",
+              region_name=AWS_REGION,
+          )
+
+          firehose_client = boto3.client(
+              "firehose",
+              region_name=AWS_REGION,
+          )
+
+          tagging_client = boto3.client(
+              "resourcegroupstaggingapi",
+              region_name=AWS_REGION,
+          )
+
+          # IAM is a global service, but the role names include the region.
+          iam_client = boto3.client("iam")
+
+
+          def get_required_env(name):
+              value = os.getenv(name)
+
+              if value is None or not value.strip():
+                  raise ValueError(
+                      f"Missing required environment variable: {name}"
+                  )
+
+              return value.strip()
+
+
+          # Tags that must also be present (with a non-blank value) on a
+          # log group before it is subscribed. Overridable with the
+          # REQUIRED_TAG_KEYS environment variable (comma-separated).
+          DEFAULT_REQUIRED_TAG_KEYS = (
+              "BU:ApplicationName,"
+              "BU:GEARID,"
+              "BU:SoftwareInstallationId"
+          )
+
+
+          def parse_required_tag_keys(
+              raw_value,
+          ):
+              """
+              Converts a comma-separated list of tag keys into a list.
+
+              Blank entries and case-insensitive duplicates are dropped.
+              The first spelling of each key is kept for log messages.
+              An empty value disables the required-tag check.
+              """
+              required_tag_keys = []
+              seen_keys = set()
+
+              for tag_key in (raw_value or "").split(","):
+                  tag_key = tag_key.strip()
+
+                  if not tag_key:
+                      continue
+
+                  if tag_key.lower() in seen_keys:
+                      continue
+
+                  seen_keys.add(tag_key.lower())
+                  required_tag_keys.append(tag_key)
+
+              return required_tag_keys
+
+
+          def find_missing_required_tags(
+              resource_tags,
+              required_tag_keys,
+          ):
+              """
+              Returns the required tag keys that are absent or blank.
+
+              Tag-key matching is case-insensitive, so BU:GEARID,
+              BU:gearid and bu:GearId all satisfy BU:GEARID.
+
+              AWS tag keys are case-sensitive, so a single log group can
+              carry more than one spelling of the same key. The
+              requirement is met when any spelling has a non-blank value.
+              """
+              values_by_key = {}
+
+              for tag_key, tag_value in resource_tags.items():
+                  values_by_key.setdefault(
+                      tag_key.strip().lower(),
+                      [],
+                  ).append(tag_value)
+
+              missing_tag_keys = []
+
+              for required_tag_key in required_tag_keys:
+                  values = values_by_key.get(
+                      required_tag_key.lower(),
+                      [],
+                  )
+
+                  has_value = any(
+                      value is not None
+                      and str(value).strip()
+                      for value in values
+                  )
+
+                  if not has_value:
+                      missing_tag_keys.append(
+                          required_tag_key
+                      )
+
+              return missing_tag_keys
+
+
+          def find_firehose_stream(
+              name_contains,
+              region,
+          ):
+              """
+              Finds exactly one Firehose delivery stream whose name contains
+              both the configured identifying string and the current AWS region.
+
+              Firehose ListDeliveryStreams pagination is handled manually using:
+                - HasMoreDeliveryStreams
+                - ExclusiveStartDeliveryStreamName
+              """
+              matches = []
+              exclusive_start_name = None
+
+              while True:
+                  request = {
+                      "Limit": 100,
+                  }
+
+                  if exclusive_start_name:
+                      request[
+                          "ExclusiveStartDeliveryStreamName"
+                      ] = exclusive_start_name
+
+                  response = firehose_client.list_delivery_streams(
+                      **request
+                  )
+
+                  stream_names = response.get(
+                      "DeliveryStreamNames",
+                      [],
+                  )
+
+                  for stream_name in stream_names:
+                      stream_name_lower = stream_name.lower()
+
+                      if (
+                          name_contains.lower()
+                          not in stream_name_lower
+                      ):
+                          continue
+
+                      if region.lower() not in stream_name_lower:
+                          continue
+
+                      description = (
+                          firehose_client.describe_delivery_stream(
+                              DeliveryStreamName=stream_name
+                          )
+                      )
+
+                      stream_description = description[
+                          "DeliveryStreamDescription"
+                      ]
+
+                      stream_status = stream_description.get(
+                          "DeliveryStreamStatus"
+                      )
+
+                      stream_arn = stream_description[
+                          "DeliveryStreamARN"
+                      ]
+
+                      matches.append(
+                          {
+                              "name": stream_name,
+                              "arn": stream_arn,
+                              "status": stream_status,
+                          }
+                      )
+
+                  if not response.get(
+                      "HasMoreDeliveryStreams",
+                      False,
+                  ):
+                      break
+
+                  if not stream_names:
+                      raise RuntimeError(
+                          "Firehose indicated that more delivery streams "
+                          "exist but did not return a continuation name"
+                      )
+
+                  exclusive_start_name = stream_names[-1]
+
+              if len(matches) == 0:
+                  raise RuntimeError(
+                      "No Firehose delivery stream was found containing "
+                      f"'{name_contains}' and region '{region}'"
+                  )
+
+              if len(matches) > 1:
+                  match_names = [
+                      match["name"]
+                      for match in matches
+                  ]
+
+                  raise RuntimeError(
+                      "Multiple Firehose delivery streams matched "
+                      f"'{name_contains}' and region '{region}': "
+                      f"{match_names}"
+                  )
+
+              match = matches[0]
+
+              if match["status"] != "ACTIVE":
+                  raise RuntimeError(
+                      f"Firehose stream {match['name']} is not ACTIVE. "
+                      f"Current status: {match['status']}"
+                  )
+
+              logger.info(
+                  "Using Firehose stream %s with ARN %s",
+                  match["name"],
+                  match["arn"],
+              )
+
+              return match["arn"]
+
+
+          def trust_policy_allows_cloudwatch_logs(
+              trust_policy,
+          ):
+              """
+              Checks whether an IAM role trust policy contains the
+              CloudWatch Logs service principal.
+
+              Handles both:
+                "Service": "logs.amazonaws.com"
+
+              and:
+                "Service": [
+                    "logs.amazonaws.com",
+                    ...
+                ]
+              """
+              statements = trust_policy.get(
+                  "Statement",
+                  [],
+              )
+
+              if isinstance(statements, dict):
+                  statements = [statements]
+
+              for statement in statements:
+                  if statement.get("Effect") != "Allow":
+                      continue
+
+                  principal = statement.get(
+                      "Principal",
+                      {},
+                  )
+
+                  if not isinstance(principal, dict):
+                      continue
+
+                  services = principal.get(
+                      "Service",
+                      [],
+                  )
+
+                  if isinstance(services, str):
+                      services = [services]
+
+                  if "logs.amazonaws.com" in services:
+                      return True
+
+              return False
+
+
+          def find_cloudwatch_logs_role(
+              name_contains,
+              region,
+          ):
+              """
+              Finds exactly one IAM role whose name contains:
+                1. The configured identifying string.
+                2. The current AWS region.
+
+              The role must also trust logs.amazonaws.com.
+              """
+              paginator = iam_client.get_paginator(
+                  "list_roles"
+              )
+
+              matches = []
+
+              for page in paginator.paginate():
+                  for role in page.get("Roles", []):
+                      role_name = role["RoleName"]
+                      role_name_lower = role_name.lower()
+
+                      if (
+                          name_contains.lower()
+                          not in role_name_lower
+                      ):
+                          continue
+
+                      if region.lower() not in role_name_lower:
+                          continue
+
+                      trust_policy = role.get(
+                          "AssumeRolePolicyDocument",
+                          {},
+                      )
+
+                      if not trust_policy_allows_cloudwatch_logs(
+                          trust_policy
+                      ):
+                          logger.info(
+                              "Ignoring IAM role %s because it does "
+                              "not trust logs.amazonaws.com",
+                              role_name,
+                          )
+
+                          continue
+
+                      matches.append(
+                          {
+                              "name": role_name,
+                              "arn": role["Arn"],
+                          }
+                      )
+
+              if len(matches) == 0:
+                  raise RuntimeError(
+                      "No CloudWatch Logs subscription role was found "
+                      f"containing '{name_contains}' and region "
+                      f"'{region}' with a logs.amazonaws.com trust policy"
+                  )
+
+              if len(matches) > 1:
+                  match_names = [
+                      match["name"]
+                      for match in matches
+                  ]
+
+                  raise RuntimeError(
+                      "Multiple CloudWatch Logs subscription roles "
+                      f"matched '{name_contains}' and region "
+                      f"'{region}': {match_names}"
+                  )
+
+              match = matches[0]
+
+              logger.info(
+                  "Using CloudWatch Logs role %s with ARN %s",
+                  match["name"],
+                  match["arn"],
+              )
+
+              return match["arn"]
+
+
+          def log_group_name_from_arn(
+              log_group_arn,
+          ):
+              """
+              Converts a CloudWatch Logs ARN such as:
+
+                arn:aws:logs:us-east-1:123456789012:
+                log-group:/aws/lambda/example
+
+              into:
+
+                /aws/lambda/example
+              """
+              separator = ":log-group:"
+
+              if separator not in log_group_arn:
+                  return None
+
+              log_group_name = log_group_arn.split(
+                  separator,
+                  1,
+              )[1]
+
+              # Defensive handling for ARNs containing the stream wildcard.
+              if log_group_name.endswith(":*"):
+                  log_group_name = log_group_name[:-2]
+
+              return log_group_name
+
+
+          def get_tagged_log_groups(
+              tag_key,
+              tag_value,
+          ):
+              """
+              Returns only CloudWatch log groups matching the configured
+              tag key and value.
+
+              The Resource Groups Tagging API performs the tag filtering,
+              avoiding one tag API request per log group.
+              """
+              paginator = tagging_client.get_paginator(
+                  "get_resources"
+              )
+
+              page_iterator = paginator.paginate(
+                  TagFilters=[
+                      {
+                          "Key": tag_key,
+                          "Values": [
+                              tag_value,
+                          ],
+                      }
+                  ],
+                  ResourceTypeFilters=[
+                      "logs:log-group",
+                  ],
+                  PaginationConfig={
+                      "PageSize": 100,
+                  },
+              )
+
+              matching_log_groups = []
+
+              for page in page_iterator:
+                  resources = page.get(
+                      "ResourceTagMappingList",
+                      [],
+                  )
+
+                  for resource in resources:
+                      resource_arn = resource.get(
+                          "ResourceARN"
+                      )
+
+                      if not resource_arn:
+                          logger.warning(
+                              "Tagging API returned a resource "
+                              "without a ResourceARN"
+                          )
+                          continue
+
+                      log_group_name = (
+                          log_group_name_from_arn(
+                              resource_arn
+                          )
+                      )
+
+                      if not log_group_name:
+                          logger.warning(
+                              "Could not extract a log-group name "
+                              "from ARN: %s",
+                              resource_arn,
+                          )
+                          continue
+
+                      resource_tags = {
+                          tag["Key"]: tag.get(
+                              "Value",
+                              "",
+                          )
+                          for tag in resource.get(
+                              "Tags",
+                              [],
+                          )
+                      }
+
+                      matching_log_groups.append(
+                          {
+                              "logGroupName": log_group_name,
+                              "arn": resource_arn,
+                              "tags": resource_tags,
+                          }
+                      )
+
+              return matching_log_groups
+
+
+          def get_subscription_filters(
+              log_group_name,
+          ):
+              response = (
+                  logs_client.describe_subscription_filters(
+                      logGroupName=log_group_name
+                  )
+              )
+
+              return response.get(
+                  "subscriptionFilters",
+                  [],
+              )
+
+
+          def subscription_is_current(
+              subscription_filter,
+              firehose_arn,
+              role_arn,
+              filter_pattern,
+          ):
+              """
+              Returns True when the existing subscription has the
+              requested destination, role, and filter pattern.
+              """
+              return (
+                  subscription_filter.get(
+                      "destinationArn"
+                  ) == firehose_arn
+                  and subscription_filter.get(
+                      "roleArn"
+                  ) == role_arn
+                  and subscription_filter.get(
+                      "filterPattern",
+                      "",
+                  ) == filter_pattern
+              )
+
+
+          def create_or_update_subscription(
+              log_group_name,
+              firehose_arn,
+              role_arn,
+              filter_name,
+              filter_pattern,
+          ):
+              existing_filters = get_subscription_filters(
+                  log_group_name
+              )
+
+              managed_filter = next(
+                  (
+                      subscription_filter
+                      for subscription_filter
+                      in existing_filters
+                      if subscription_filter.get(
+                          "filterName"
+                      ) == filter_name
+                  ),
+                  None,
+              )
+
+              if managed_filter and subscription_is_current(
+                  subscription_filter=managed_filter,
+                  firehose_arn=firehose_arn,
+                  role_arn=role_arn,
+                  filter_pattern=filter_pattern,
+              ):
+                  logger.info(
+                      "Subscription is already current on %s",
+                      log_group_name,
+                  )
+
+                  return "exists"
+
+              # Updating a filter with the same name does not require
+              # consuming another subscription-filter slot.
+              if (
+                  managed_filter is None
+                  and len(existing_filters) >= 2
+              ):
+                  existing_filter_names = [
+                      subscription_filter.get(
+                          "filterName"
+                      )
+                      for subscription_filter
+                      in existing_filters
+                  ]
+
+                  logger.warning(
+                      "Skipping %s because it already has two "
+                      "subscription filters: %s",
+                      log_group_name,
+                      existing_filter_names,
+                  )
+
+                  return "skipped"
+
+              logs_client.put_subscription_filter(
+                  logGroupName=log_group_name,
+                  filterName=filter_name,
+                  filterPattern=filter_pattern,
+                  destinationArn=firehose_arn,
+                  roleArn=role_arn,
+              )
+
+              if managed_filter:
+                  logger.info(
+                      "Updated subscription on %s",
+                      log_group_name,
+                  )
+
+                  return "updated"
+
+              logger.info(
+                  "Created subscription on %s",
+                  log_group_name,
+              )
+
+              return "created"
+
+
+          # Firehose and IAM role lookups are cached between invocations
+          # that reuse the same warm Lambda instance. With reserved
+          # concurrency of 1, queued runs from bulk tagging all reuse one
+          # instance, so only the first run pays for the lookups.
+          LOOKUP_CACHE_TTL_SECONDS = 900
+
+          _lookup_cache = {}
+
+
+          def cached_lookup(
+              cache_key,
+              lookup,
+              refresh=False,
+          ):
+              """
+              Returns a cached lookup result, calling lookup() when there
+              is no entry, the entry is older than the TTL, or refresh is
+              True. Failed lookups raise and are never cached.
+              """
+              now = time.monotonic()
+              cached = _lookup_cache.get(cache_key)
+
+              if (
+                  not refresh
+                  and cached
+                  and now - cached["at"] < LOOKUP_CACHE_TTL_SECONDS
+              ):
+                  logger.info(
+                      "Using cached %s lookup: %s",
+                      cache_key[0],
+                      cached["value"],
+                  )
+
+                  return cached["value"]
+
+              value = lookup()
+
+              _lookup_cache[cache_key] = {
+                  "value": value,
+                  "at": now,
+              }
+
+              return value
+
+
+          CLOUDTRAIL_DETAIL_TYPE = "AWS API Call via CloudTrail"
+
+
+          def get_partition(
+              context,
+          ):
+              """
+              Reads the AWS partition (aws, aws-us-gov, aws-cn) from the
+              function's own ARN.
+              """
+              function_arn = (
+                  getattr(
+                      context,
+                      "invoked_function_arn",
+                      "",
+                  )
+                  or ""
+              )
+
+              parts = function_arn.split(":")
+
+              if len(parts) > 1 and parts[1]:
+                  return parts[1]
+
+              return "aws"
+
+
+          def log_group_targets_from_event(
+              event,
+              context,
+          ):
+              """
+              Returns the log group named in a CloudTrail tagging event as
+              a list of {"logGroupName", "arn"} dicts:
+
+                TagResource     -> requestParameters.resourceArn
+                TagLogGroup     -> requestParameters.logGroupName
+                CreateLogGroup  -> requestParameters.logGroupName
+
+              Returns None for anything that is not a CloudTrail event
+              (a manual test or the daily schedule), which means "check
+              every tagged log group".
+              """
+              if not isinstance(event, dict):
+                  return None
+
+              if event.get("detail-type") != CLOUDTRAIL_DETAIL_TYPE:
+                  return None
+
+              detail = event.get("detail") or {}
+
+              request_parameters = (
+                  detail.get("requestParameters") or {}
+              )
+
+              resource_arn = request_parameters.get(
+                  "resourceArn"
+              )
+
+              log_group_name = request_parameters.get(
+                  "logGroupName"
+              )
+
+              if resource_arn:
+                  if resource_arn.endswith(":*"):
+                      resource_arn = resource_arn[:-2]
+
+                  log_group_name = log_group_name_from_arn(
+                      resource_arn
+                  )
+
+                  if log_group_name:
+                      return [
+                          {
+                              "logGroupName": log_group_name,
+                              "arn": resource_arn,
+                          }
+                      ]
+
+              elif log_group_name:
+                  account_id = (
+                      event.get("account")
+                      or detail.get("recipientAccountId")
+                  )
+
+                  if account_id:
+                      region = event.get(
+                          "region",
+                          AWS_REGION,
+                      )
+
+                      return [
+                          {
+                              "logGroupName": log_group_name,
+                              "arn": (
+                                  f"arn:{get_partition(context)}:logs:"
+                                  f"{region}:{account_id}:log-group:"
+                                  f"{log_group_name}"
+                              ),
+                          }
+                      ]
+
+              logger.warning(
+                  "Could not find a log group in the CloudTrail "
+                  "event; checking every tagged log group instead"
+              )
+
+              return None
+
+
+          def get_event_log_groups(
+              targets,
+              tag_key,
+              tag_value,
+              results,
+          ):
+              """
+              Reads the current tags of each log group named in the event
+              and keeps only those still tagged tag_key=tag_value.
+
+              Tags are read fresh rather than taken from the event, so a
+              tag that was removed again before this run is respected.
+              """
+              log_groups = []
+
+              for target in targets:
+                  log_group_name = target["logGroupName"]
+                  log_group_arn = target["arn"]
+
+                  try:
+                      response = logs_client.list_tags_for_resource(
+                          resourceArn=log_group_arn
+                      )
+
+                  except ClientError as error:
+                      aws_error = error.response.get(
+                          "Error",
+                          {},
+                      )
+
+                      error_code = aws_error.get(
+                          "Code",
+                          "Unknown",
+                      )
+
+                      if error_code == "ResourceNotFoundException":
+                          logger.info(
+                              "Ignoring %s because it no longer exists",
+                              log_group_name,
+                          )
+
+                          results["not_tagged"] += 1
+
+                          results["details"].append(
+                              {
+                                  "logGroupName": log_group_name,
+                                  "logGroupArn": log_group_arn,
+                                  "status": "not_tagged",
+                                  "reason": "log group no longer exists",
+                              }
+                          )
+
+                          continue
+
+                      results["errors"] += 1
+
+                      logger.exception(
+                          "AWS error reading tags for %s",
+                          log_group_name,
+                      )
+
+                      results["details"].append(
+                          {
+                              "logGroupName": log_group_name,
+                              "logGroupArn": log_group_arn,
+                              "status": "error",
+                              "errorCode": error_code,
+                              "error": aws_error.get(
+                                  "Message",
+                                  str(error),
+                              ),
+                          }
+                      )
+
+                      continue
+
+                  resource_tags = response.get(
+                      "tags",
+                      {},
+                  )
+
+                  if resource_tags.get(tag_key) != tag_value:
+                      logger.info(
+                          "Ignoring %s because it is no longer "
+                          "tagged %s=%s",
+                          log_group_name,
+                          tag_key,
+                          tag_value,
+                      )
+
+                      results["not_tagged"] += 1
+
+                      results["details"].append(
+                          {
+                              "logGroupName": log_group_name,
+                              "logGroupArn": log_group_arn,
+                              "status": "not_tagged",
+                              "reason": (
+                                  f"not tagged {tag_key}={tag_value}"
+                              ),
+                          }
+                      )
+
+                      continue
+
+                  log_groups.append(
+                      {
+                          "logGroupName": log_group_name,
+                          "arn": log_group_arn,
+                          "tags": resource_tags,
+                      }
+                  )
+
+              return log_groups
+
+
+          def finish(
+              results,
+          ):
+              # A failure may mean a cached Firehose stream or role is
+              # stale, so make the next run look them up again.
+              if results["errors"]:
+                  _lookup_cache.clear()
+
+              logger.info(
+                  "Execution results: %s",
+                  json.dumps(results),
+              )
+
+              return {
+                  "statusCode": (
+                      200
+                      if results["errors"] == 0
+                      else 207
+                  ),
+                  "body": json.dumps(
+                      results,
+                      indent=2,
+                  ),
+              }
+
+
+          def lambda_handler(
+              event,
+              context,
+          ):
+              tag_key = get_required_env(
+                  "TAG_KEY"
+              )
+
+              tag_value = get_required_env(
+                  "TAG_VALUE"
+              )
+
+              firehose_name_contains = get_required_env(
+                  "FIREHOSE_NAME_CONTAINS"
+              )
+
+              role_name_contains = get_required_env(
+                  "ROLE_NAME_CONTAINS"
+              )
+
+              filter_name = os.getenv(
+                  "SUBSCRIPTION_FILTER_NAME",
+                  "DynatraceManagedSubscription",
+              ).strip()
+
+              # An empty filter pattern forwards all log events.
+              filter_pattern = os.getenv(
+                  "FILTER_PATTERN",
+                  "",
+              )
+
+              required_tag_keys = parse_required_tag_keys(
+                  os.getenv(
+                      "REQUIRED_TAG_KEYS",
+                      DEFAULT_REQUIRED_TAG_KEYS,
+                  )
+              )
+
+              targets = log_group_targets_from_event(
+                  event,
+                  context,
+              )
+
+              # "targeted": only the log group named in a CloudTrail event.
+              # "full": every tagged log group (manual run, daily schedule).
+              mode = "full" if targets is None else "targeted"
+
+              results = {
+                  "region": AWS_REGION,
+                  "mode": mode,
+                  "matched": 0,
+                  "created": 0,
+                  "updated": 0,
+                  "exists": 0,
+                  "skipped": 0,
+                  "missing_tags": 0,
+                  "not_tagged": 0,
+                  "errors": 0,
+                  "details": [],
+              }
+
+              logger.info(
+                  "Starting subscription management in region %s",
+                  AWS_REGION,
+              )
+
+              logger.info(
+                  "Invoked by: %s",
+                  (
+                      event.get("detail-type", "direct invocation")
+                      if isinstance(event, dict)
+                      else "direct invocation"
+                  ),
+              )
+
+              logger.info(
+                  "Required tags (case-insensitive keys): %s",
+                  required_tag_keys or "none",
+              )
+
+              if mode == "full":
+                  logger.info(
+                      "Full check: searching for CloudWatch log "
+                      "groups with tag %s=%s",
+                      tag_key,
+                      tag_value,
+                  )
+
+                  tagged_log_groups = get_tagged_log_groups(
+                      tag_key=tag_key,
+                      tag_value=tag_value,
+                  )
+
+              else:
+                  logger.info(
+                      "Targeted check: only processing %s",
+                      [
+                          target["logGroupName"]
+                          for target in targets
+                      ],
+                  )
+
+                  tagged_log_groups = get_event_log_groups(
+                      targets=targets,
+                      tag_key=tag_key,
+                      tag_value=tag_value,
+                      results=results,
+                  )
+
+              results["matched"] = len(
+                  tagged_log_groups
+              )
+
+              logger.info(
+                  "Found %s tagged CloudWatch log groups "
+                  "to process in region %s",
+                  len(tagged_log_groups),
+                  AWS_REGION,
+              )
+
+              if not tagged_log_groups:
+                  return finish(results)
+
+              # Find the regional Dynatrace resources. Targeted runs reuse
+              # cached results; full runs always look them up fresh.
+              firehose_arn = cached_lookup(
+                  (
+                      "firehose",
+                      firehose_name_contains,
+                      AWS_REGION,
+                  ),
+                  lambda: find_firehose_stream(
+                      name_contains=firehose_name_contains,
+                      region=AWS_REGION,
+                  ),
+                  refresh=(mode == "full"),
+              )
+
+              role_arn = cached_lookup(
+                  (
+                      "role",
+                      role_name_contains,
+                      AWS_REGION,
+                  ),
+                  lambda: find_cloudwatch_logs_role(
+                      name_contains=role_name_contains,
+                      region=AWS_REGION,
+                  ),
+                  refresh=(mode == "full"),
+              )
+
+              for log_group in tagged_log_groups:
+                  log_group_name = log_group[
+                      "logGroupName"
+                  ]
+
+                  log_group_arn = log_group["arn"]
+
+                  try:
+                      logger.info(
+                          "Processing tagged log group: %s",
+                          log_group_name,
+                      )
+
+                      missing_tag_keys = find_missing_required_tags(
+                          resource_tags=log_group["tags"],
+                          required_tag_keys=required_tag_keys,
+                      )
+
+                      if missing_tag_keys:
+                          logger.warning(
+                              "Skipping %s because these required tags "
+                              "are missing or empty: %s",
+                              log_group_name,
+                              missing_tag_keys,
+                          )
+
+                          results["missing_tags"] += 1
+
+                          results["details"].append(
+                              {
+                                  "logGroupName": log_group_name,
+                                  "logGroupArn": log_group_arn,
+                                  "status": "missing_tags",
+                                  "missingTags": missing_tag_keys,
+                              }
+                          )
+
+                          continue
+
+                      status = create_or_update_subscription(
+                          log_group_name=log_group_name,
+                          firehose_arn=firehose_arn,
+                          role_arn=role_arn,
+                          filter_name=filter_name,
+                          filter_pattern=filter_pattern,
+                      )
+
+                      results[status] += 1
+
+                      results["details"].append(
+                          {
+                              "logGroupName": log_group_name,
+                              "logGroupArn": log_group_arn,
+                              "status": status,
+                          }
+                      )
+
+                  except ClientError as error:
+                      results["errors"] += 1
+
+                      aws_error = error.response.get(
+                          "Error",
+                          {},
+                      )
+
+                      error_code = aws_error.get(
+                          "Code",
+                          "Unknown",
+                      )
+
+                      error_message = aws_error.get(
+                          "Message",
+                          str(error),
+                      )
+
+                      logger.exception(
+                          "AWS error processing %s",
+                          log_group_name,
+                      )
+
+                      results["details"].append(
+                          {
+                              "logGroupName": log_group_name,
+                              "logGroupArn": log_group_arn,
+                              "status": "error",
+                              "errorCode": error_code,
+                              "error": error_message,
+                          }
+                      )
+
+                  except Exception as error:
+                      results["errors"] += 1
+
+                      logger.exception(
+                          "Unexpected error processing %s",
+                          log_group_name,
+                      )
+
+                      results["details"].append(
+                          {
+                              "logGroupName": log_group_name,
+                              "logGroupArn": log_group_arn,
+                              "status": "error",
+                              "error": str(error),
+                          }
+                      )
+
+              return finish(results)
+
+  # ======================================================================
+  # EventBridge trigger (CloudTrail)
+  # ======================================================================
+  # Fires once per successful CloudTrail-recorded call that applies
+  # TAG_KEY=TAG_VALUE to a log group: TagResource, the legacy TagLogGroup, or
+  # CreateLogGroup with the tag set at creation. The function then processes
+  # only that log group. Requires a CloudTrail trail recording management
+  # events in this region.
+  CloudTrailTagRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub Runs ${FunctionName} when a log group is tagged ${TagKey}=${TagValue}.
+      State: ENABLED
+      EventPattern: !Sub |
+        {
+          "source": ["aws.logs"],
+          "detail-type": ["AWS API Call via CloudTrail"],
+          "detail": {
+            "eventSource": ["logs.amazonaws.com"],
+            "eventName": ["TagResource", "TagLogGroup", "CreateLogGroup"],
+            "errorCode": [{"exists": false}],
+            "requestParameters": {
+              "tags": {
+                "${TagKey}": ["${TagValue}"]
+              }
+            }
+          }
+        }
+      Targets:
+        - Id: SubscriberFunction
+          Arn: !GetAtt SubscriberFunction.Arn
+
+  CloudTrailTagRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SubscriberFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt CloudTrailTagRule.Arn
+
+  # ======================================================================
+  # Daily full check
+  # ======================================================================
+  # A scheduled event (no CloudTrail detail) makes the function check every
+  # tagged log group, the same as a manual run with {}.
+  FullCheckRule:
+    Type: AWS::Events::Rule
+    Condition: HasFullCheckSchedule
+    Properties:
+      Description: !Sub Full check of every log group tagged ${TagKey}=${TagValue}.
+      State: ENABLED
+      ScheduleExpression: !Ref FullCheckSchedule
+      Targets:
+        - Id: SubscriberFunction
+          Arn: !GetAtt SubscriberFunction.Arn
+
+  FullCheckRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasFullCheckSchedule
+    Properties:
+      FunctionName: !Ref SubscriberFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt FullCheckRule.Arn
+
+Outputs:
+  FunctionName:
+    Value: !Ref SubscriberFunction
+  FunctionArn:
+    Value: !GetAtt SubscriberFunction.Arn
+  ExecutionRoleArn:
+    Value: !GetAtt SubscriberExecutionRole.Arn
+  CloudTrailTagRuleArn:
+    Value: !GetAtt CloudTrailTagRule.Arn
+  FullCheckRuleArn:
+    Condition: HasFullCheckSchedule
+    Value: !GetAtt FullCheckRule.Arn
